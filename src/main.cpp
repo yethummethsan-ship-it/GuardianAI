@@ -42,6 +42,426 @@ uint8_t getFingerprintID();
 uint8_t getFingerprintEnroll(uint8_t id);
 
 void setup() {
+  // Initialize Serial Communication
+  Serial.begin(115200);
+  delay(100);
+  
+  Serial.println("\n\n================================");
+  Serial.println("Guardian AI Door Lock System");
+  Serial.println("================================\n");
+  
+  // Initialize Hardware
+  initializeHardware();
+  
+  // Initialize Fingerprint Sensor
+  FingerprintSerial.begin(FINGERPRINT_BAUDRATE, SERIAL_8N1, FINGERPRINT_RX_PIN, FINGERPRINT_TX_PIN);
+  delay(100);
+  
+  if (finger.verifyPassword()) {
+    Serial.println("[OK] Fingerprint sensor initialized successfully");
+  } else {
+    Serial.println("[ERROR] Could not communicate with fingerprint sensor");
+    while (1) { delay(1); }
+  }
+  
+  // Read sensor parameters
+  finger.getParameters();
+  
+  // Print template count
+  Serial.print("Number of fingerprints stored: ");
+  Serial.println(finger.templateCount);
+  
+  // Print Menu
+  printMenuOptions();
+  
+  // Initial buzzer beep to indicate system ready
+  triggerBuzzer(200);
+}
+
+void loop() {
+  // Check for Serial input
+  if (Serial.available()) {
+    uint8_t command = Serial.read();
+    
+    // Consume newline character if present
+    if (Serial.available() && Serial.peek() == '\n') {
+      Serial.read();
+    }
+    
+    switch (command) {
+      case 'E':
+      case 'e':
+        enrollFingerprint();
+        printMenuOptions();
+        break;
+        
+      case 'M':
+      case 'm':
+        matchFingerprint();
+        printMenuOptions();
+        break;
+        
+      case 'H':
+      case 'h':
+        printMenuOptions();
+        break;
+        
+      case 'S':
+      case 's':
+        Serial.println("\n[INFO] System Status:");
+        Serial.print("  Lock Status: ");
+        Serial.println(lockEngaged ? "LOCKED" : "UNLOCKED");
+        Serial.print("  Failure Count: ");
+        Serial.println(failureCount);
+        Serial.print("  Alarm Triggered: ");
+        Serial.println(alarmTriggered ? "YES" : "NO");
+        Serial.print("  Motion Detected: ");
+        Serial.println(motionDetected ? "YES" : "NO");
+        Serial.print("  Vibration Detected: ");
+        Serial.println(vibrationDetected ? "YES" : "NO");
+        Serial.print("  Stored Fingerprints: ");
+        Serial.println(finger.templateCount);
+        Serial.println();
+        printMenuOptions();
+        break;
+        
+      default:
+        Serial.println("[WARNING] Invalid command. Type 'H' for help.");
+        printMenuOptions();
+        break;
+    }
+  }
+  
+  // Check motion sensor
+  checkMotionSensor();
+  
+  // Check vibration sensor
+  checkVibrationSensor();
+  
+  // Handle tamper detection
+  if (motionDetected || vibrationDetected) {
+    if (!alarmTriggered) {
+      handleTamper();
+    }
+  }
+  
+  // Auto-lock door after unlock duration
+  if (!lockEngaged && (millis() - unlockStartTime >= UNLOCK_DURATION)) {
+    lockDoor();
+  }
+  
+  delay(50);  // Small delay to prevent watchdog timeout
+}
+
+void initializeHardware() {
+  // Configure GPIO pins
+  pinMode(SOLENOID_LOCK_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(PIR_MOTION_PIN, INPUT);
+  pinMode(VIBRATION_SENSOR_PIN, INPUT);
+  
+  // Set initial states
+  digitalWrite(SOLENOID_LOCK_PIN, HIGH);  // Solenoid lock is active LOW, so HIGH = locked
+  digitalWrite(BUZZER_PIN, LOW);          // Buzzer off initially
+  
+  Serial.println("[OK] Hardware pins configured");
+}
+
+void printMenuOptions() {
+  Serial.println("\n========== MENU OPTIONS ==========");
+  Serial.println("E - Enroll new fingerprint");
+  Serial.println("M - Match/identify fingerprint");
+  Serial.println("S - System status");
+  Serial.println("H - Show this menu");
+  Serial.println("==================================\n");
+}
+
+void enrollFingerprint() {
+  Serial.println("\n[ENROLL] Fingerprint enrollment mode");
+  Serial.print("Enter fingerprint ID (1-127): ");
+  
+  while (!Serial.available()) {
+    delay(100);
+  }
+  
+  uint8_t id = Serial.parseInt();
+  
+  // Consume newline
+  if (Serial.available() && Serial.peek() == '\n') {
+    Serial.read();
+  }
+  
+  if (id < 1 || id > 127) {
+    Serial.println("[ERROR] Invalid ID. Must be between 1-127");
+    return;
+  }
+  
+  Serial.print("Enrolling ID #");
+  Serial.println(id);
+  
+  uint8_t result = getFingerprintEnroll(id);
+  
+  if (result == FINGERPRINT_OK) {
+    Serial.print("[SUCCESS] Fingerprint ID #");
+    Serial.print(id);
+    Serial.println(" enrolled successfully");
+    triggerBuzzer(300);
+  } else {
+    Serial.println("[ERROR] Enrollment failed");
+    triggerBuzzer(100);
+    delay(100);
+    triggerBuzzer(100);
+  }
+}
+
+void matchFingerprint() {
+  Serial.println("\n[MATCH] Waiting for fingerprint...");
+  triggerBuzzer(100);
+  
+  uint8_t result = getFingerprintID();
+  
+  if (result == FINGERPRINT_OK) {
+    Serial.println("[SUCCESS] Fingerprint matched!");
+    failureCount = 0;
+    alarmTriggered = false;
+    triggerBuzzer(500);
+    delay(500);
+    triggerBuzzer(500);
+    unlockDoor();
+  } else if (result == FINGERPRINT_NOTFOUND) {
+    failureCount++;
+    Serial.print("[FAILED] No match found. Failures: ");
+    Serial.print(failureCount);
+    Serial.print("/");
+    Serial.println(ALARM_THRESHOLD);
+    
+    // Trigger warning buzzer
+    triggerBuzzer(BUZZER_WARNING_DURATION);
+    
+    // Check if alarm threshold reached
+    if (failureCount >= ALARM_THRESHOLD) {
+      Serial.println("[ALARM] Multiple failed attempts detected!");
+      alarmTriggered = true;
+      handleTamper();
+    }
+  } else {
+    Serial.println("[ERROR] Communication error with fingerprint sensor");
+  }
+}
+
+uint8_t getFingerprintID() {
+  uint8_t p = finger.getImage();
+  
+  if (p != FINGERPRINT_OK) {
+    return p;
+  }
+  
+  p = finger.image2Tz();
+  if (p != FINGERPRINT_OK) {
+    return p;
+  }
+  
+  p = finger.fingerFastSearch();
+  if (p == FINGERPRINT_OK) {
+    Serial.print("Found ID #");
+    Serial.print(finger.fingerID);
+    Serial.print(" with confidence ");
+    Serial.println(finger.confidence);
+    return FINGERPRINT_OK;
+  } else if (p == FINGERPRINT_NOTFOUND) {
+    Serial.println("No matching fingerprint found");
+    return FINGERPRINT_NOTFOUND;
+  } else {
+    Serial.println("Communication error");
+    return p;
+  }
+}
+
+uint8_t getFingerprintEnroll(uint8_t id) {
+  int p = -1;
+  Serial.print("Waiting for valid finger to enroll as #");
+  Serial.println(id);
+  
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    
+    if (p == FINGERPRINT_NOFINGER) {
+      // Serial.print(".");
+    } else if (p == FINGERPRINT_OK) {
+      Serial.println("Image taken");
+    } else if (p == FINGERPRINT_PACKETRECIEVEERR) {
+      Serial.println("Communication error");
+      return p;
+    } else if (p == FINGERPRINT_IMAGEFAIL) {
+      Serial.println("Imaging error");
+      return p;
+    } else {
+      Serial.print("Unknown error: ");
+      Serial.println(p);
+      return p;
+    }
+  }
+  
+  // OK success!
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK) {
+    Serial.println("Image conversion failed");
+    return p;
+  }
+  
+  Serial.println("Remove finger");
+  delay(2000);
+  p = 0;
+  while (p != FINGERPRINT_NOFINGER) {
+    p = finger.getImage();
+  }
+  
+  p = -1;
+  Serial.println("Place same finger again");
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    if (p == FINGERPRINT_OK) {
+      Serial.println("Image taken");
+    } else if (p == FINGERPRINT_NOFINGER) {
+      // Serial.print(".");
+    } else if (p == FINGERPRINT_PACKETRECIEVEERR) {
+      Serial.println("Communication error");
+      return p;
+    } else if (p == FINGERPRINT_IMAGEFAIL) {
+      Serial.println("Imaging error");
+      return p;
+    } else {
+      Serial.print("Unknown error: ");
+      Serial.println(p);
+      return p;
+    }
+  }
+  
+  // OK success!
+  p = finger.image2Tz(2);
+  if (p != FINGERPRINT_OK) {
+    Serial.println("Image conversion failed");
+    return p;
+  }
+  
+  // OK converted!
+  Serial.print("Creating model for #");
+  Serial.println(id);
+  
+  p = finger.createModel();
+  if (p == FINGERPRINT_OK) {
+    Serial.println("Prints matched!");
+  } else if (p == FINGERPRINT_ENROLLMISMATCH) {
+    Serial.println("Fingerprints did not match");
+    return p;
+  } else {
+    Serial.println("Unknown error");
+    return p;
+  }
+  
+  Serial.print("ID ");
+  Serial.println(id);
+  p = finger.storeModel(id);
+  if (p == FINGERPRINT_OK) {
+    Serial.println("Stored!");
+    return FINGERPRINT_OK;
+  } else if (p == FINGERPRINT_BADLOCATION) {
+    Serial.println("Bad location");
+    return p;
+  } else if (p == FINGERPRINT_FLASHERR) {
+    Serial.println("Flash error");
+    return p;
+  } else {
+    Serial.println("Unknown error");
+    return p;
+  }
+}
+
+void triggerBuzzer(uint16_t duration) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(duration);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void unlockDoor() {
+  Serial.println("[ACTION] DOOR UNLOCKED - Solenoid relay activated");
+  digitalWrite(SOLENOID_LOCK_PIN, LOW);  // Active LOW - pull to ground to activate
+  lockEngaged = false;
+  unlockStartTime = millis();
+}
+
+void lockDoor() {
+  Serial.println("[ACTION] DOOR LOCKED - Solenoid relay deactivated");
+  digitalWrite(SOLENOID_LOCK_PIN, HIGH);  // Return to HIGH to lock
+  lockEngaged = true;
+  failureCount = 0;  // Reset failure count when door re-locks
+}
+
+void checkMotionSensor() {
+  static unsigned long lastMotionTime = 0;
+  static bool lastMotionState = false;
+  
+  bool currentMotionState = digitalRead(PIR_MOTION_PIN);
+  
+  if (currentMotionState && !lastMotionState) {
+    lastMotionTime = millis();
+    motionDetected = true;
+    Serial.println("[ALERT] Motion detected by PIR sensor!");
+  }
+  
+  // Reset motion flag after 5 seconds of no motion
+  if (motionDetected && (millis() - lastMotionTime > 5000)) {
+    motionDetected = false;
+  }
+  
+  lastMotionState = currentMotionState;
+}
+
+void checkVibrationSensor() {
+  static unsigned long lastVibrationTime = 0;
+  static bool lastVibrationState = false;
+  
+  bool currentVibrationState = digitalRead(VIBRATION_SENSOR_PIN);
+  
+  if (currentVibrationState && !lastVibrationState) {
+    lastVibrationTime = millis();
+    vibrationDetected = true;
+    Serial.println("[ALERT] Vibration detected by SW-420 sensor!");
+  }
+  
+  // Reset vibration flag after 5 seconds of no vibration
+  if (vibrationDetected && (millis() - lastVibrationTime > 5000)) {
+    vibrationDetected = false;
+  }
+  
+  lastVibrationState = currentVibrationState;
+}
+
+void handleTamper() {
+  Serial.println("\n[!!! TAMPER ALERT !!!]");
+  Serial.println("Unauthorized access attempt or physical tampering detected!");
+  
+  // Lock the door immediately
+  if (!lockEngaged) {
+    lockDoor();
+  }
+  
+  // Trigger alarm buzzer pattern
+  for (int i = 0; i < 5; i++) {
+    triggerBuzzer(BUZZER_ALARM_DURATION);
+    delay(300);
+  }
+  
+  alarmTriggered = true;
+}
+void checkMotionSensor();
+void checkVibrationSensor();
+void handleTamper();
+void printMenuOptions();
+uint8_t getFingerprintID();
+uint8_t getFingerprintEnroll(uint8_t id);
+
+void setup() {
   Serial.begin(115200);
   delay(100);
   
